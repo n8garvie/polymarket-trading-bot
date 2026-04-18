@@ -1,19 +1,14 @@
-import { ClobClient } from "@polymarket/clob-client";
 import OpenAI from "openai";
-import { ethers } from "ethers";
 import cron from "node-cron";
 import { Telegraf } from "telegraf";
 import express from "express";
-import Database from "better-sqlite3";
+import sqlite3 from "sqlite3";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 // Configuration
 const CONFIG = {
-  apiKey: process.env.POLYMARKET_API_KEY || "",
-  secret: process.env.POLYMARKET_SECRET || "",
-  passphrase: process.env.POLYMARKET_PASSPHRASE || "",
   openaiKey: process.env.OPENAI_API_KEY || "",
   maxPositionSize: parseFloat(process.env.MAX_POSITION_SIZE || "100"),
   stopLossPercent: parseFloat(process.env.STOP_LOSS_PERCENT || "5"),
@@ -24,13 +19,6 @@ const CONFIG = {
 };
 
 // Initialize clients
-const clobClient = new ClobClient({
-  host: "https://clob.polymarket.com",
-  chainId: 137, // Polygon
-  signatureType: 0,
-  funder: new ethers.Wallet(CONFIG.secret),
-});
-
 const openai = new OpenAI({ apiKey: CONFIG.openaiKey });
 
 const bot = CONFIG.telegramToken 
@@ -38,8 +26,8 @@ const bot = CONFIG.telegramToken
   : null;
 
 // Database setup
-const db = new Database("trades.db");
-db.exec(`
+const db = new sqlite3.Database("trades.db");
+db.run(`
   CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     marketId TEXT,
@@ -49,8 +37,9 @@ db.exec(`
     timestamp INTEGER,
     status TEXT,
     pnl REAL
-  );
-  
+  )
+`);
+db.run(`
   CREATE TABLE IF NOT EXISTS positions (
     marketId TEXT PRIMARY KEY,
     side TEXT,
@@ -59,15 +48,22 @@ db.exec(`
     currentPrice REAL,
     unrealizedPnl REAL,
     timestamp INTEGER
-  );
+  )
 `);
 
 // State
 let isRunning = false;
 let activePositions: Map<string, any> = new Map();
 
+// Simulated market data for demo
+const MOCK_MARKETS = [
+  { id: "market-1", title: "Will BTC hit $100K in 2025?", price: 0.65, volume: 500000, liquidity: 100000 },
+  { id: "market-2", title: "Will Trump win 2024 election?", price: 0.48, volume: 1200000, liquidity: 300000 },
+  { id: "market-3", title: "Will ETH ETF be approved?", price: 0.72, volume: 800000, liquidity: 200000 },
+];
+
 // Market Analysis with AI
-async function analyzeMarket(marketId: string, marketData: any): Promise<{
+async function analyzeMarket(market: any): Promise<{
   signal: "buy" | "sell" | "hold";
   confidence: number;
   reasoning: string;
@@ -80,10 +76,10 @@ async function analyzeMarket(marketId: string, marketData: any): Promise<{
           role: "system",
           content: `You are a prediction market analyst. Analyze the market data and provide a trading signal.
           
-Market: ${marketData.title}
-Current Price: ${marketData.price}
-Volume: ${marketData.volume}
-Liquidity: ${marketData.liquidity}
+Market: ${market.title}
+Current Price: ${market.price}
+Volume: ${market.volume}
+Liquidity: ${market.liquidity}
 
 Respond with JSON:
 {
@@ -113,27 +109,21 @@ async function executeTrade(marketId: string, side: "buy" | "sell", size: number
       return;
     }
 
-    // Execute trade via Polymarket API
-    const order = await clobClient.createOrder({
-      tokenId: marketId,
-      side: side === "buy" ? "BUY" : "SELL",
-      size: size.toString(),
-      price: "0", // Market order
-    });
-
+    // Simulate trade execution
+    const price = Math.random() * 0.5 + 0.25; // Random price between 0.25 and 0.75
+    
     // Record trade
-    const stmt = db.prepare(`
-      INSERT INTO trades (marketId, side, size, price, timestamp, status, pnl)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(marketId, side, size, order.price, Date.now(), "filled", 0);
+    db.run(
+      `INSERT INTO trades (marketId, side, size, price, timestamp, status, pnl) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [marketId, side, size, price, Date.now(), "filled", 0]
+    );
 
     // Update positions
     if (side === "buy") {
       activePositions.set(marketId, {
         side: "long",
         size,
-        entryPrice: parseFloat(order.price),
+        entryPrice: price,
         timestamp: Date.now()
       });
     } else {
@@ -141,7 +131,7 @@ async function executeTrade(marketId: string, side: "buy" | "sell", size: number
     }
 
     // Notify
-    const message = `🚀 Trade Executed\nMarket: ${marketId}\nSide: ${side.toUpperCase()}\nSize: $${size}`;
+    const message = `🚀 Trade Executed\nMarket: ${marketId}\nSide: ${side.toUpperCase()}\nSize: $${size.toFixed(2)}\nPrice: $${price.toFixed(3)}`;
     console.log(message);
     
     if (bot && CONFIG.telegramChatId) {
@@ -156,17 +146,16 @@ async function executeTrade(marketId: string, side: "buy" | "sell", size: number
 // Risk Management
 function checkStopLosses() {
   for (const [marketId, position] of activePositions) {
-    // Get current price (simplified - would fetch from API)
-    const currentPrice = position.entryPrice; // Placeholder
+    const currentPrice = position.entryPrice * (1 + (Math.random() - 0.5) * 0.1);
     const pnlPercent = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
     
     if (pnlPercent <= -CONFIG.stopLossPercent) {
-      console.log(`Stop loss triggered for ${marketId}`);
+      console.log(`Stop loss triggered for ${marketId} (${pnlPercent.toFixed(2)}%)`);
       executeTrade(marketId, "sell", position.size);
     }
     
     if (pnlPercent >= CONFIG.takeProfitPercent) {
-      console.log(`Take profit triggered for ${marketId}`);
+      console.log(`Take profit triggered for ${marketId} (+${pnlPercent.toFixed(2)}%)`);
       executeTrade(marketId, "sell", position.size);
     }
   }
@@ -179,19 +168,11 @@ async function tradingLoop() {
   try {
     console.log("📊 Running trading analysis...");
 
-    // Get active markets
-    const markets = await clobClient.getMarkets();
-    
-    // Filter for liquid markets
-    const tradableMarkets = markets.filter((m: any) => 
-      m.volume > 10000 && m.liquidity > 5000
-    ).slice(0, 10); // Top 10 markets
-
-    for (const market of tradableMarkets) {
+    for (const market of MOCK_MARKETS) {
       // Analyze with AI
-      const analysis = await analyzeMarket(market.id, market);
+      const analysis = await analyzeMarket(market);
       
-      console.log(`Market: ${market.title}`);
+      console.log(`\nMarket: ${market.title}`);
       console.log(`Signal: ${analysis.signal} (${analysis.confidence}%)`);
       console.log(`Reasoning: ${analysis.reasoning}`);
 
@@ -228,13 +209,17 @@ app.get("/api/status", (req, res) => {
 });
 
 app.get("/api/positions", (req, res) => {
-  const positions = db.prepare("SELECT * FROM positions").all();
-  res.json(positions);
+  db.all("SELECT * FROM positions", [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
 });
 
 app.get("/api/history", (req, res) => {
-  const trades = db.prepare("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 100").all();
-  res.json(trades);
+  db.all("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 100", [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
 });
 
 app.post("/api/start", (req, res) => {

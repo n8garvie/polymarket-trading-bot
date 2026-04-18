@@ -5,3 +5,4 @@ dist/
 trades.db
 *.log
 .DS_Store
+.vercel
